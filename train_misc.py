@@ -1,5 +1,6 @@
 import six
 import math
+import torch
 
 import lib.layers.wrappers.cnf_regularization as reg_lib
 import lib.spectral_norm as spectral_norm
@@ -11,6 +12,8 @@ def standard_normal_logprob(z):
     logZ = -0.5 * math.log(2 * math.pi)
     return logZ - z.pow(2) / 2
 
+def standard_normal_score(z):
+    return -z
 
 def set_cnf_options(args, model):
 
@@ -59,7 +62,7 @@ def count_nfe(model):
             self.num_evals = 0
 
         def __call__(self, module):
-            if isinstance(module, layers.ODEfunc):
+            if isinstance(module, layers.ODEfunc) or isinstance(module, layers.TestODEfunc):
                 self.num_evals += module.num_evals()
 
     accumulator = AccNumEvals()
@@ -157,7 +160,7 @@ def get_regularization(model, regularization_coeffs):
     return acc_reg_states
 
 
-def build_model_tabular(args, dims, regularization_fns=None):
+def build_model_tabular(args, dims, score_target, regularization_fns=None):
 
     hidden_dims = tuple(map(int, args.dims.split("-")))
 
@@ -175,6 +178,7 @@ def build_model_tabular(args, dims, regularization_fns=None):
             divergence_fn=args.divergence_fn,
             residual=args.residual,
             rademacher=args.rademacher,
+            score_target=score_target,
         )
         cnf = layers.CNF(
             odefunc=odefunc,
@@ -186,15 +190,33 @@ def build_model_tabular(args, dims, regularization_fns=None):
         return cnf
 
     chain = [build_cnf() for _ in range(args.num_blocks)]
-    if args.batch_norm:
-        bn_layers = [layers.MovingBatchNorm1d(dims, bn_lag=args.bn_lag) for _ in range(args.num_blocks)]
-        bn_chain = [layers.MovingBatchNorm1d(dims, bn_lag=args.bn_lag)]
-        for a, b in zip(chain, bn_layers):
-            bn_chain.append(a)
-            bn_chain.append(b)
-        chain = bn_chain
+
     model = layers.SequentialFlow(chain)
 
     set_cnf_options(args, model)
+
+    return model
+
+
+def build_model_test(args, convection, mollifier, diffeq):
+
+    def build_test_f():
+        odefunc = layers.TestODEfunc(
+            diffeq=diffeq,
+            divergence_fn=args.divergence_fn,
+            convection=convection,
+            mollifier=mollifier
+        )
+        test_f = layers.TestFlow(
+            odefunc=odefunc,
+            solver=args.solver,
+            atol=args.atol,
+            rtol=args.atol,
+        )
+        return test_f
+
+    assert args.num_blocks == 1
+
+    model = build_test_f()
 
     return model

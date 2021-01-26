@@ -3,11 +3,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from math import sqrt
 
+from gaussian_util import gaussian_score, DEFAULT_MU, DEFAULT_SIGMA
 from . import diffeq_layers
 from .squeeze import squeeze, unsqueeze
 
-__all__ = ["ODEnet", "AutoencoderDiffEqNet", "ODEfunc", "AutoencoderODEfunc"]
+__all__ = ["ODEnet", "AutoencoderDiffEqNet", "ODEfunc", "AutoencoderODEfunc", "TestODEfunc"]
 
 
 def divergence_bf(dx, y, **unused_kwargs):
@@ -156,6 +158,7 @@ class ODEnet(nn.Module):
 
         self.layers = nn.ModuleList(layers)
         self.activation_fns = nn.ModuleList(activation_fns[:-1])
+        self.is_updated = False
 
     def forward(self, t, y):
         dx = y
@@ -254,7 +257,7 @@ class AutoencoderDiffEqNet(nn.Module):
 
 class ODEfunc(nn.Module):
 
-    def __init__(self, diffeq, divergence_fn="approximate", residual=False, rademacher=False):
+    def __init__(self, diffeq, score_target, divergence_fn="approximate", residual=False, rademacher=False):
         super(ODEfunc, self).__init__()
         assert divergence_fn in ("brute_force", "approximate")
 
@@ -269,6 +272,7 @@ class ODEfunc(nn.Module):
             self.divergence_fn = divergence_approx
 
         self.register_buffer("_num_evals", torch.tensor(0.))
+        self.score_target = score_target
 
     def before_odeint(self, e=None):
         self._e = e
@@ -278,9 +282,17 @@ class ODEfunc(nn.Module):
         return self._num_evals.item()
 
     def forward(self, t, states):
-        assert len(states) >= 2
-        y = states[0]
 
+        self.diffeq.is_updated = True
+
+
+        assert len(states) >= 4
+        if len(states) == 7:
+            mu = states[4]
+            sigma_half = states[5]
+            # gaussian_error_t = states[6]
+        y = states[0]
+        score = states[2]
         # increment num evals
         self._num_evals += 1
 
@@ -298,20 +310,31 @@ class ODEfunc(nn.Module):
         with torch.set_grad_enabled(True):
             y.requires_grad_(True)
             t.requires_grad_(True)
-            for s_ in states[2:]:
-                s_.requires_grad_(True)
-            dy = self.diffeq(t, y, *states[2:])
+            dy = self.diffeq(t, y)
             # Hack for 2D data to use brute force divergence computation.
             if not self.training and dy.view(dy.shape[0], -1).shape[1] == 2:
                 divergence = divergence_bf(dy, y).view(batchsize, 1)
             else:
                 divergence = self.divergence_fn(dy, y, e=self._e).view(batchsize, 1)
+            dscore = torch.autograd.grad(torch.sum(-divergence), y, create_graph=True)[0]
+            dwgf_reg = torch.norm(-dy - score + self.score_target(y))**2/y.shape[0]
+
+        dlogp_y = -divergence
         if self.residual:
             dy = dy - y
             divergence -= torch.ones_like(divergence) * torch.tensor(np.prod(y.shape[1:]), dtype=torch.float32
                                                                      ).to(divergence)
-        return tuple([dy, -divergence] + [torch.zeros_like(s_).requires_grad_(True) for s_ in states[2:]])
+        if len(states) == 7:
+            dmu = torch.matmul(DEFAULT_SIGMA_INV.to(y), DEFAULT_MU.to(y) - mu)
+            dsigma_half = - torch.matmul(DEFAULT_SIGMA_INV.to(y), sigma_half) + torch.inverse(sigma_half).transpose(0, 1)
+            sigma = torch.matrix_power(sigma_half, 2)
+            dgaussian_error = torch.norm(gaussian_score(y, mu=mu, sigma=sigma) - score)**2/y.shape[0]
+            return tuple([dy, dlogp_y, dscore, dwgf_reg, dmu, dsigma_half, dgaussian_error])
+        else:
+            return tuple([dy, dlogp_y, dscore, dwgf_reg])
 
+
+DEFAULT_SIGMA_INV = torch.inverse(DEFAULT_SIGMA)
 
 class AutoencoderODEfunc(nn.Module):
 
@@ -361,3 +384,58 @@ class AutoencoderODEfunc(nn.Module):
                                                                      ).to(divergence)
 
         return dy, -divergence
+
+
+class TestODEfunc(nn.Module):
+    def __init__(self, diffeq, convection, mollifier, divergence_fn="approximate"):
+        super(TestODEfunc, self).__init__()
+        self.diffeq = diffeq
+        self.convection = convection
+        self.mollifier = mollifier
+
+        if divergence_fn == "brute_force":
+            self.divergence_fn = divergence_bf
+        elif divergence_fn == "approximate":
+            self.divergence_fn = divergence_approx
+
+        self.register_buffer("_num_evals", torch.tensor(0.))
+
+    def before_odeint(self, e=None):
+        self._e = e
+        self._num_evals.fill_(0)
+
+    def forward(self, t, states):
+        # print(t)
+        # states[0]: the particles of particle method
+        x = states[0]
+        score_particle_x = self.mollifier.score(x, x)
+        dx = self.convection(x) - score_particle_x
+
+        self._num_evals += 1
+
+
+        with torch.set_grad_enabled(True):
+        # states[1]: the particles of diffeq
+            y = states[1]
+            t = torch.tensor(t).type_as(y)
+            y.requires_grad_(True)
+            dy = self.diffeq(t, y)
+
+        # states[2]: the score of the distribution induced by diffeq
+            score_NODE = states[2]
+            batchsize = y.shape[0]
+
+            if dy.view(dy.shape[0], -1).shape[1] == 2:
+                divergence = divergence_bf(dy, y).view(batchsize, 1)
+            else:
+                divergence = self.divergence_fn(dy, y, e=self._e).view(batchsize, 1)
+            dscore = torch.autograd.grad(torch.sum(-divergence), y, create_graph=False)[0]
+
+        # states[3]: the accumulated difference between the particle system and the diffeq (in terms of score)
+        score_particle_y = self.mollifier.score(x, y)
+        diff = torch.norm(score_particle_y - score_NODE)**2/batchsize
+
+        return tuple([dx, dy, dscore, diff])
+
+    def num_evals(self):
+        return self._num_evals.item()
