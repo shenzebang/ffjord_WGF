@@ -298,7 +298,7 @@ class ODEfunc(nn.Module):
         with torch.set_grad_enabled(True):
             y.requires_grad_(True)
             t.requires_grad_(True)
-            dy = self.diffeq(t, y)
+            dy = self.diffeq(t, y) - self.convection(y)
             # Hack for 2D data to use brute force divergence computation.
             if not self.training and dy.view(dy.shape[0], -1).shape[1] == 2:
                 divergence = divergence_bf(dy, y).view(batchsize, 1)
@@ -307,7 +307,7 @@ class ODEfunc(nn.Module):
             dscore_1 = torch.autograd.grad(torch.sum(-divergence), y, create_graph=True)[0]
             dscore_2 = torch.autograd.grad(torch.sum(dy*score.detach()), y, create_graph=True)[0]
             dscore = dscore_1 - dscore_2
-            dwgf_reg = self.exp_decay**t * torch.norm(dy + score + self.convection(y))**2/y.shape[0]
+            dwgf_reg = self.exp_decay**t * torch.norm(dy + score)**2/y.shape[0]
 
         dlogp_y = -divergence
 
@@ -442,11 +442,10 @@ class CompareVelocities(nn.Module):
         x = states[0]
         batchsize = x.shape[0]
 
-        dstates = self.ode_func(t, states)
-        dx = dstates[0]
-        dx_NODE = self.diffeq(t, x)
+        dstates, dscorex = self.ode_func(t, states)
+        dscorex_NODE = - self.diffeq(t, x)
 
-        diff_t = torch.norm(dx - dx_NODE)**2/batchsize
+        diff_t = torch.norm(dscorex - dscorex_NODE)**2/batchsize
 
         self._num_evals += 1
 
@@ -472,7 +471,7 @@ class DVPODEfunc(nn.Module):
         dx = - self.convection(x) - score_particle_x
         self._num_evals += 1
 
-        return tuple([dx])
+        return tuple([dx]),  score_particle_x
 
     def num_evals(self):
         return self._num_evals.item()
@@ -499,9 +498,10 @@ class GaussianODEfunc(nn.Module):
         sigma = torch.matrix_power(sigma_half, 2)
 
         dx = - self.convection(x)
-        dx = dx - gaussian_score(x, mu, sigma)
+        score_x = gaussian_score(x, mu, sigma)
+        dx = dx - score_x
         self._num_evals += 1
-        return tuple([dx, dmu, dsigma_half])
+        return tuple([dx, dmu, dsigma_half]), score_x
 
     def num_evals(self):
         return self._num_evals.item()

@@ -40,6 +40,16 @@ class CNF(nn.Module):
         _wgf_reg = wgf_reg
 
 
+        # initialze odefunc.
+        n_steps_init = 1000
+        diffeq = self.odefunc.diffeq
+        optimizer = torch.optim.Adam(diffeq.parameters())
+        for _ in range(n_steps_init):
+            optimizer.zero_grad()
+            loss = torch.nn.functional.mse_loss(diffeq(torch.tensor([0]).to(z), z), -_score)
+            loss.backward()
+            optimizer.step()
+
         integration_times = torch.tensor([0.0, self.sqrt_end_time * self.sqrt_end_time]).to(z)
 
         # Refresh the odefunc statistics.
