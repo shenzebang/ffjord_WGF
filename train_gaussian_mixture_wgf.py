@@ -15,11 +15,11 @@ from lib.visualize_flow import visualize_transform
 import lib.layers.odefunc as odefunc
 
 from train_misc import standard_normal_logprob, standard_normal_score
-from gaussian_util import gaussian_score, gaussian_logprob, IsometricGaussianMollifier, DEFAULT_MU, DEFAULT_SIGMA, DEFAULT_SIGMA_INV
+from gaussian_util import gaussian_mixture_score, gaussian_logprob, IsometricGaussianMollifier, DEFAULT_CENTERS
 from train_misc import set_cnf_options, count_nfe, count_parameters, count_total_time
 from train_misc import add_spectral_norm, spectral_norm_power_iteration
 from train_misc import create_regularization_fns, get_regularization, append_regularization_to_log
-from train_misc import build_model_tabular, build_model_compare_Gaussian, build_model_compare_DVP
+from train_misc import build_model_tabular, build_model_compare_DVP
 
 from diagnostics.viz_toy import save_trajectory, trajectory_to_video
 from torch.utils.tensorboard import SummaryWriter
@@ -127,6 +127,9 @@ def compute_loss_wgf(args, model, dim, batch_size=None):
 
     nfe = count_nfe(model)
 
+    torch.save(x, 'output/NWGF_output_gaussian_mixture.pt')
+
+
     return wgf_reg/nfe
 
 
@@ -139,28 +142,8 @@ def compare_with_DV_particle_method(args, model, dim, batch_size=None):
     x_t, diff_t = model(x, diff_0, integration_times=args.time_length)
 
     nfe = count_nfe(model)
-    # print(torch.mean(x_t, dim=0))
-    # print(torch.mean(y_t, dim=0))
-    # print(torch.norm(score_t[0])**2)
-    torch.save(x_t, 'output/DVP_output_gaussian.pt')
+    torch.save(x_t, 'output/DVP_output_gaussian_mixture.pt')
 
-
-    return diff_t[0] / nfe
-
-def compare_with_Gaussian(args, model, dim, batch_size=None):
-    if batch_size is None: batch_size = args.batch_size
-
-    x = torch.randn([batch_size, dim], dtype=torch.float32, device=device)
-    mu_0 = torch.zeros(dim, dtype=torch.float32, device=device)
-    sigma_half_0 = torch.eye(dim, dtype=torch.float32, device=device)
-    diff_0 = torch.zeros(1, dtype=torch.float32, device=device)
-
-    x_t, mu_t, sigma_half_t, diff_t = model(x, mu_0, sigma_half_0, diff_0, integration_times=args.time_length)
-
-    nfe = count_nfe(model)
-    # print(torch.mean(x_t, dim=0))
-    # print(torch.mean(y_t, dim=0))
-    # print(torch.norm(score_t[0])**2)
     return diff_t[0] / nfe
 
 
@@ -168,11 +151,9 @@ def compare_with_Gaussian(args, model, dim, batch_size=None):
 if __name__ == '__main__':
     # only a single block of diffeq is supported now
     assert args.num_blocks == 1
-    mu = DEFAULT_MU.to(device)
-    sigma = DEFAULT_SIGMA.to(device)
-    sigma_inv = DEFAULT_SIGMA_INV.to(device)
-    dim = mu.shape[0]
-    convection = lambda x: -gaussian_score(x, mu, sigma)
+    centers = DEFAULT_CENTERS.to(device)
+    dim = centers.shape[1]
+    convection = lambda x: -gaussian_mixture_score(x, centers)
 
     writer = SummaryWriter('out/wgf/gaussian')
 
@@ -185,14 +166,6 @@ if __name__ == '__main__':
                                 exp_decay=args.exp_decay
                                 ).to(device)
 
-
-    model_validate_gaussian = build_model_compare_Gaussian(
-                                    args=args,
-                                    mu=mu,
-                                    sigma_inv=sigma_inv,
-                                    convection=convection,
-                                    diffeq=model.chain[0].odefunc.diffeq
-                                    ).to(device)
 
     model_validate_dvp = build_model_compare_DVP(
                                     args=args,
@@ -275,14 +248,10 @@ if __name__ == '__main__':
                 # model.eval()
                 # test_loss = score_error_wgf(args, model, batch_size=args.test_batch_size)
                 test_loss_dvp = compare_with_DV_particle_method(args, model_validate_dvp, dim, batch_size=args.n_particle_DV)
-                test_loss_gaussian = compare_with_Gaussian(args, model_validate_gaussian, dim, batch_size=args.test_batch_size)
 
 
                 test_nfe = count_nfe(model)
                 log_message = '[TEST] Iter {:04d} | DVP Test Loss {:.6f} | NFE {:.0f}'.format(itr, test_loss_dvp.item(),
-                                                                                          test_nfe)
-                logger.info(log_message)
-                log_message = '[TEST] Iter {:04d} | Gaussian Test Loss {:.6f} | NFE {:.0f}'.format(itr, test_loss_gaussian.item(),
                                                                                           test_nfe)
                 logger.info(log_message)
 

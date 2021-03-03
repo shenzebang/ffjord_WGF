@@ -62,7 +62,7 @@ def count_nfe(model):
             self.num_evals = 0
 
         def __call__(self, module):
-            if isinstance(module, layers.ODEfunc) or isinstance(module, layers.TestODEfunc):
+            if isinstance(module, layers.ODEfunc) or isinstance(module, layers.TestFlow):
                 self.num_evals += module.num_evals()
 
     accumulator = AccNumEvals()
@@ -160,7 +160,7 @@ def get_regularization(model, regularization_coeffs):
     return acc_reg_states
 
 
-def build_model_tabular(args, dims, score_target, regularization_fns=None):
+def build_model_tabular(args, dims, convection, exp_decay=0.99, regularization_fns=None):
 
     hidden_dims = tuple(map(int, args.dims.split("-")))
 
@@ -178,7 +178,8 @@ def build_model_tabular(args, dims, score_target, regularization_fns=None):
             divergence_fn=args.divergence_fn,
             residual=args.residual,
             rademacher=args.rademacher,
-            score_target=score_target,
+            convection=convection,
+            exp_decay=exp_decay
         )
         cnf = layers.CNF(
             odefunc=odefunc,
@@ -198,9 +199,60 @@ def build_model_tabular(args, dims, score_target, regularization_fns=None):
     return model
 
 
-def build_model_test(args, convection, mollifier, diffeq):
+def build_model_compare_Gaussian(args, mu, sigma_inv, convection, diffeq):
 
     def build_test_f():
+        gaussian_ode_func = layers.GaussianODEfunc(
+            target_mu=mu,
+            target_sigma_inv=sigma_inv,
+            convection=convection
+        )
+        comparefunc = layers.CompareVelocities(
+            diffeq=diffeq,
+            ode_func=gaussian_ode_func
+        )
+        test_f = layers.TestFlowGaussian(
+            odefunc=comparefunc,
+            solver=args.solver,
+            atol=args.atol,
+            rtol=args.atol,
+        )
+        return test_f
+
+    assert args.num_blocks == 1
+
+    model = build_test_f()
+
+    return model
+
+def build_model_compare_DVP(args, convection, mollifier, diffeq):
+
+    def build_test_f():
+        dvp_odef_unc = layers.DVPODEfunc(
+            convection=convection,
+            mollifier=mollifier
+        )
+        comparefunc = layers.CompareVelocities(
+            diffeq=diffeq,
+            ode_func=dvp_odef_unc
+        )
+        test_f = layers.TestFlowDVP(
+            odefunc=comparefunc,
+            solver=args.solver,
+            atol=args.atol,
+            rtol=args.atol,
+        )
+        return test_f
+
+    assert args.num_blocks == 1
+
+    model = build_test_f()
+
+    return model
+
+def build_model_compare(args, ODEfunc1, ODEfunc2):
+    # A model that compares the trajectory of two ODEs
+    def build_compare_f():
         odefunc = layers.TestODEfunc(
             diffeq=diffeq,
             divergence_fn=args.divergence_fn,
@@ -217,6 +269,6 @@ def build_model_test(args, convection, mollifier, diffeq):
 
     assert args.num_blocks == 1
 
-    model = build_test_f()
+    model = build_compare_f()
 
     return model
